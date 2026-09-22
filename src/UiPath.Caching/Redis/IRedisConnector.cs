@@ -14,6 +14,9 @@ public interface IRedisConnector : IConnectionState, IDisposable
 
     EndPoint[] GetEndPoints(bool configuredOnly = false);
 
+    /// <summary>The connected primaries, for a server-scoped command such as <c>SCAN</c>.</summary>
+    IEnumerable<IServer> GetPrimaries() => [];
+
     /// <summary>Optionally pre-establishes the connection on a fully async path.</summary>
     ValueTask ConnectAsync(CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
 }

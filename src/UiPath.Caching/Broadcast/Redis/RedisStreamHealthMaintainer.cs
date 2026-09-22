@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Hosting;
 using UiPath.Caching.Telemetry;
@@ -389,17 +390,61 @@ public partial class RedisStreamHealthMaintainer : IHostedService
 
     private async Task<List<StreamContext>> GetAllStreamsAsync(CancellationToken cancellationToken)
     {
-        var ret = new List<StreamContext>();
+        // A set: a slot in migration answers on both its source and its target primary.
+        var discovered = new HashSet<RedisKey>();
+        var primaries = _redis.GetPrimaries().ToList();
+        if (primaries.Count == 0)
+        {
+            LogNoPrimariesToScan();
+            await ScanStreamsAsync((command, args, flags) => Database.ExecuteAsync(command, args, flags), discovered, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // In parallel, so the pass costs the slowest shard rather than their sum and stays inside the lock.
+            foreach (var keys in await Task.WhenAll(primaries.Select(primary => ScanPrimaryAsync(primary, cancellationToken))).ConfigureAwait(false))
+            {
+                discovered.UnionWith(keys);
+            }
+        }
+
+        var ret = new List<StreamContext>(discovered.Count);
+        foreach (var key in discovered)
+        {
+            ret.Add(new StreamContext(key, QuarantineKey(key)));
+        }
+
+        return ret;
+    }
+
+    private async Task<HashSet<RedisKey>> ScanPrimaryAsync(IServer primary, CancellationToken cancellationToken)
+    {
+        var keys = new HashSet<RedisKey>();
+        try
+        {
+            // The database-scoped overload: the three-argument one builds the message with db -1, which
+            // StackExchange.Redis refuses for SCAN before it reaches the wire.
+            await ScanStreamsAsync((command, args, flags) => primary.ExecuteAsync(null, command, args, flags), keys, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogPrimaryScanFailed(ex, primary.EndPoint);
+        }
+
+        return keys;
+    }
+
+    private async Task ScanStreamsAsync(
+        Func<string, ICollection<object>, CommandFlags, Task<RedisResult>> executeAsync,
+        HashSet<RedisKey> discovered,
+        CancellationToken cancellationToken)
+    {
         ulong pointer = 0;
         while (!cancellationToken.IsCancellationRequested)
         {
-            var result = await Database.ExecuteAsync("SCAN", [pointer.ToString(), "MATCH", _streamsSearchPattern, "COUNT", 100, "TYPE", "stream"], CommandFlags.DemandMaster).ConfigureAwait(false);
+            var result = await executeAsync("SCAN", [pointer.ToString(CultureInfo.InvariantCulture), "MATCH", _streamsSearchPattern, "COUNT", 100, "TYPE", "stream"], CommandFlags.DemandMaster).ConfigureAwait(false);
 
             (ulong tempPointer, List<RedisKey> keys) = ParseStreamScan(result);
-            foreach (var key in keys)
-            {
-                ret.Add(new StreamContext(key, QuarantineKey(key)));
-            }
+            discovered.UnionWith(keys);
 
             if (tempPointer == 0)
             {
@@ -408,8 +453,6 @@ public partial class RedisStreamHealthMaintainer : IHostedService
 
             pointer = tempPointer;
         }
-
-        return ret;
     }
 
     private void TrackStream(RedisKey stream, StreamInfo streamInfo)
@@ -490,6 +533,12 @@ public partial class RedisStreamHealthMaintainer : IHostedService
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Redis stream monitor")]
     private partial void LogRedisStreamMonitorError(Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "Stream discovery failed on primary {EndPoint}; its streams go unmaintained this cycle")]
+    private partial void LogPrimaryScanFailed(Exception ex, EndPoint endPoint);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "No primary could be enumerated for stream discovery; scanning only the routed server, which on a cluster reaches one shard")]
+    private partial void LogNoPrimariesToScan();
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Stream {StreamKey} has no consumers")]
     private partial void LogStreamHasNoConsumers(RedisKey streamKey);

@@ -1,3 +1,4 @@
+using System.Net;
 using System.Reflection;
 using Microsoft.Extensions.Logging;
 using NSubstitute.ExceptionExtensions;
@@ -25,6 +26,7 @@ public class RedisStreamHealthMaintainerTests(ITestContextAccessor testContextAc
     private bool _successStreamDeleteConsumerGroup = true;
 
     private RedisValue[] _streams = ["stream1", "stream2"];
+    private IServer _primary = default!;
     private ITransaction _transaction = default!;
     private bool _transactionSuccess = true;
 
@@ -42,7 +44,7 @@ public class RedisStreamHealthMaintainerTests(ITestContextAccessor testContextAc
     {
         _ownLock = false;
         await Sut.CheckStreamsAsync(testContextAccessor.Current.CancellationToken);
-        await _database.DidNotReceive().ExecuteAsync(Arg.Any<string>(), Arg.Any<ICollection<object>?>(), Arg.Any<CommandFlags>());
+        await _primary.DidNotReceive().ExecuteAsync(Arg.Any<int?>(), Arg.Any<string>(), Arg.Any<ICollection<object>>(), Arg.Any<CommandFlags>());
         _telemetryProvider.Metrics.Should().BeEmpty();
     }
 
@@ -51,7 +53,7 @@ public class RedisStreamHealthMaintainerTests(ITestContextAccessor testContextAc
     {
         Sut.Initialize();
         await Sut.CheckStreamsAsync(testContextAccessor.Current.CancellationToken);
-        await _database.Received().ExecuteAsync(Arg.Any<string>(), Arg.Any<ICollection<object>?>(), Arg.Any<CommandFlags>());
+        await _primary.Received().ExecuteAsync(Arg.Any<int?>(), Arg.Any<string>(), Arg.Any<ICollection<object>>(), Arg.Any<CommandFlags>());
         _telemetryProvider.Metrics.Should().NotBeEmpty();
     }
 
@@ -309,10 +311,54 @@ public class RedisStreamHealthMaintainerTests(ITestContextAccessor testContextAc
         Sut.Initialize();
         await Sut.CheckStreamsAsync(testContextAccessor.Current.CancellationToken);
 
-        await _database.Received().ExecuteAsync(
+        await _primary.Received().ExecuteAsync(
+            Arg.Any<int?>(),
             "SCAN",
-            Arg.Is<ICollection<object>?>(args => args != null && args.Contains((object)"explicit-pattern-*")),
+            Arg.Is<ICollection<object>>(args => args != null && args.Contains((object)"explicit-pattern-*")),
             Arg.Any<CommandFlags>());
+    }
+
+    [Fact]
+    public async Task Every_primary_is_scanned_so_streams_on_other_shards_are_discovered()
+    {
+        var firstPrimary = StubPrimaryHolding("shard1-stream");
+        var secondPrimary = StubPrimaryHolding("shard2-stream");
+        _redisConnector.GetPrimaries().Returns([firstPrimary, secondPrimary]);
+        _database.KeyExistsAsync(Arg.Any<RedisKey>(), Arg.Any<CommandFlags>()).Returns(true);
+
+        Sut.Initialize();
+        await Sut.CheckStreamsAsync(testContextAccessor.Current.CancellationToken);
+
+        await firstPrimary.Received().ExecuteAsync(Arg.Any<int?>(), "SCAN", Arg.Any<ICollection<object>>(), Arg.Any<CommandFlags>());
+        await secondPrimary.Received().ExecuteAsync(Arg.Any<int?>(), "SCAN", Arg.Any<ICollection<object>>(), Arg.Any<CommandFlags>());
+        await _database.Received().StreamInfoAsync(Arg.Is<RedisKey>(key => key == "shard1-stream"), Arg.Any<CommandFlags>());
+        await _database.Received().StreamInfoAsync(Arg.Is<RedisKey>(key => key == "shard2-stream"), Arg.Any<CommandFlags>());
+        await _database.DidNotReceive().ExecuteAsync("SCAN", Arg.Any<ICollection<object>?>(), Arg.Any<CommandFlags>());
+    }
+
+    [Fact]
+    public async Task A_primary_that_cannot_be_scanned_does_not_cost_the_other_primaries_their_maintenance()
+    {
+        var unreachable = StubUnreachablePrimary();
+        var healthy = StubPrimaryHolding("shard2-stream");
+        _redisConnector.GetPrimaries().Returns([unreachable, healthy]);
+        _database.KeyExistsAsync(Arg.Any<RedisKey>(), Arg.Any<CommandFlags>()).Returns(true);
+
+        Sut.Initialize();
+        await Sut.CheckStreamsAsync(testContextAccessor.Current.CancellationToken);
+
+        await _database.Received().StreamInfoAsync(Arg.Is<RedisKey>(key => key == "shard2-stream"), Arg.Any<CommandFlags>());
+    }
+
+    [Fact]
+    public async Task No_enumerable_primary_falls_back_to_the_routed_database()
+    {
+        _redisConnector.GetPrimaries().Returns([]);
+
+        Sut.Initialize();
+        await Sut.CheckStreamsAsync(testContextAccessor.Current.CancellationToken);
+
+        await _database.Received().ExecuteAsync("SCAN", Arg.Any<ICollection<object>?>(), Arg.Any<CommandFlags>());
     }
 
     [Fact]
@@ -341,6 +387,13 @@ public class RedisStreamHealthMaintainerTests(ITestContextAccessor testContextAc
         _redisConnector = _fixture.Freeze<IRedisConnector>();
         _database = _fixture.Freeze<IDatabase>();
         _redisConnector.Database.Returns(_database);
+
+        // A real connector reports its primaries; the routed-database fallback has its own test.
+        _primary = Substitute.For<IServer>();
+        _primary.EndPoint.Returns(new DnsEndPoint("primary", 6379));
+        _primary.ExecuteAsync(Arg.Any<int?>(), Arg.Is<string>(command => command == "SCAN"), Arg.Any<ICollection<object>>(), Arg.Any<CommandFlags>())
+            .Returns(_ => RedisResult.Create([RedisResult.Create((RedisValue)0), RedisResult.Create(_streams)]));
+        _redisConnector.GetPrimaries().Returns(_ => new[] { _primary });
 
         _telemetryProvider = new RecordingTelemetryProvider();
         _fixture.Inject<ICachingTelemetryProvider>(_telemetryProvider);
@@ -391,6 +444,24 @@ public class RedisStreamHealthMaintainerTests(ITestContextAccessor testContextAc
         _transaction = _fixture.Freeze<ITransaction>();
         _transaction.ExecuteAsync().Returns(c => _transactionSuccess);
         return ValueTask.CompletedTask;
+    }
+
+    private static IServer StubPrimaryHolding(RedisValue streamKey)
+    {
+        var primary = Substitute.For<IServer>();
+        primary.EndPoint.Returns(new DnsEndPoint(streamKey.ToString(), 6379));
+        primary.ExecuteAsync(Arg.Any<int?>(), Arg.Is<string>(command => command == "SCAN"), Arg.Any<ICollection<object>>(), Arg.Any<CommandFlags>())
+            .Returns(_ => RedisResult.Create([RedisResult.Create((RedisValue)0), RedisResult.Create([streamKey])]));
+        return primary;
+    }
+
+    private static IServer StubUnreachablePrimary()
+    {
+        var primary = Substitute.For<IServer>();
+        primary.EndPoint.Returns(new DnsEndPoint("unreachable", 6379));
+        primary.ExecuteAsync(Arg.Any<int?>(), Arg.Any<string>(), Arg.Any<ICollection<object>>(), Arg.Any<CommandFlags>())
+            .Returns<Task<RedisResult>>(_ => throw new RedisConnectionException(ConnectionFailureType.UnableToConnect, CommandFlags.None, "unreachable", null, CommandStatus.Unknown));
+        return primary;
     }
 
 #pragma warning disable CS0618 // Deprecated but still honored, and the key shape it selects is what these tests cover.
@@ -444,5 +515,4 @@ public class RedisStreamHealthMaintainerTests(ITestContextAccessor testContextAc
            (object?)_fixture.Create<long>()];
         return (StreamConsumerInfo)Activator.CreateInstance(typeof(StreamConsumerInfo), BindingFlags.Instance | BindingFlags.NonPublic, null, args, null)!;
     }
-
 }
