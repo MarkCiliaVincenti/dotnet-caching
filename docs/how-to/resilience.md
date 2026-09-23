@@ -436,7 +436,14 @@ policy forever, logging `It was not possible to connect to the redis server(s) <
 `Error` every few seconds. Commands still flow to the surviving nodes, so nothing else trips.
 The scan only judges endpoints the multiplexer discovered (never the ones in your connection
 string), only after they have been down for the threshold, and only when the cluster topology
-confirms the node is gone. The membership check re-runs the client's own connection handshake
+confirms the node is gone. A reconfiguration the client reports through `ConfigurationChanged` —
+a node restoring, or a `MOVED` naming one it does not know — is the moment a departure becomes
+visible, so the scan also runs five seconds after the last of a burst, judging every down endpoint
+without waiting out the threshold or a recent member confirmation. A change stays pending until a
+scan actually judges it, so one the scheduled scan could not run is taken by the next interval's. The scan's own membership refresh reconfigures
+too, so a change reported within one scan interval of that refresh is not taken as news.
+`HashSlotMoved` is not used: it fires once per slot, and a node still migrating slots is still a
+member. The membership check re-runs the client's own connection handshake
 (`IConnectionMultiplexer.ConfigureAsync`) and reads the `ClusterConfiguration` it records on the
 configured endpoints, the only ones that handshake refreshes. The configuration counts only if the
 refresh replaced it, since a landed re-read installs a new instance; if it did not, or the refresh
@@ -460,7 +467,8 @@ refreshes, so that a single lost topology reply is retried instead, the scan emi
 reporting the same failure every interval.
 
 **Which offering sends maintenance events, and how.** There are two routes, and the difference
-decides what this library does about them.
+decides what this library does about them. Both arrive on the connection carrying your commands:
+planned maintenance opens none of its own, so the rebuild above carries its subscription along.
 
 Azure Cache for Redis Basic, Standard and Premium publish on the `AzureRedisEvents` pub/sub
 channel. The server announces that a node is going away but hands nothing off, so
@@ -475,9 +483,9 @@ the handoff. It opens a maintenance window instead, so health reporting does not
 fault while it is in progress. Azure Managed Redis (`*.redis.azure.net`) is recognised as a
 provider but nothing turns the request on for it, so `MaintenanceNotifications` below is what asks.
 
-A notification can arrive more than once: Azure's is a broadcast every connection receives, and a
-push frame is replayed to a connection that reconnects, which the client collapses only within the
-multiplexer that received it. So both routes record, and a copy matching one seen in the last 30
+A notification can arrive more than once: Azure's is a broadcast a retiring connection still
+forwards alongside its replacement, and a push frame is replayed to a connection that reconnects,
+which the client collapses only within the multiplexer that received it. So a copy matching one seen in the last 30
 seconds is dropped — keyed on the notification's own identity (the fields parsed from Azure's
 payload, or a push frame's type and sequence id) and measured on timestamps rather than the wall
 clock. Two kinds are never collapsed, a duplicate costing less than a loss: a frame whose sequence
@@ -485,13 +493,9 @@ could not be read, reported as zero and told apart from a genuine zero by the `s
 description; and a source this library does not model, whose payload carries no uniqueness
 contract.
 
-Two asymmetries remain. A push frame on the planned-maintenance connection is ignored, since that
-connection carries no commands. And only a `MOVING` is tied to a connection generation — the one
-carrying commands or the one about to, since a rebuild subscribes the replacement before
-publishing it and the server never replays a `MOVING`.
-
-The command route is also the only one that opens a window, for the same reason: it is the
-connection whose disruption the cache would feel.
+One asymmetry remains: only a `MOVING` is tied to a connection generation — the one carrying
+commands or the one about to, since a rebuild subscribes the replacement before publishing it and
+the server never replays a `MOVING`.
 
 A window lasts as long as the server announced, clamped to the range the client relaxes its own
 timeouts over — `maintRelaxedTimeout` to `maintRelaxedWindowMax` — and a completion hands over to
