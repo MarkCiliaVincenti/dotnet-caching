@@ -4,6 +4,9 @@
     "rollForward": "latestMinor",
     "allowPrerelease": false
   },
+  "msbuild-sdks": {
+    "FrameworkCompatibleVersions": "1.0.0"
+  },
   "test": {
     "runner": "Microsoft.Testing.Platform"
   }
